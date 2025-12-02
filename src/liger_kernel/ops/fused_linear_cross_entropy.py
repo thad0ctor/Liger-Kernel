@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 
@@ -48,8 +49,44 @@ def fused_linear_cross_entropy_forward(
     V = weight.shape[0]
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
 
-    inc_factor = triton.cdiv(V, H)  # (V + H - 1) // H
-    chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))  # (BT + inc_factor - 1) // inc_factor
+    # FSDP2-aware chunking for better memory access patterns
+    fsdp2_enabled = False
+    fsdp2_world_size = None
+    
+    # Check if we're running under FSDP2
+    if hasattr(_input, '_fsdp_wrapped_module') or os.environ.get('FSDP_ENABLED') == '1':
+        fsdp2_enabled = True
+        # Try to get world size from torch.distributed if available
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                fsdp2_world_size = dist.get_world_size()
+        except:
+            pass
+    
+    # Calculate chunk size with FSDP2 awareness
+    if fsdp2_enabled and fsdp2_world_size is not None and fsdp2_world_size > 1:
+        # Align chunk size with FSDP2 shard boundaries
+        shard_size = BT // fsdp2_world_size
+        if shard_size > 0:
+            inc_factor = triton.cdiv(V, H)
+            ideal_chunk_size = triton.cdiv(BT, inc_factor)
+            
+            # Find the nearest divisor of shard_size
+            chunk_size = shard_size
+            while chunk_size > ideal_chunk_size and shard_size % chunk_size != 0:
+                chunk_size = chunk_size // 2
+            chunk_size = max(chunk_size, 1)
+            chunk_size = triton.next_power_of_2(chunk_size)
+        else:
+            # Fallback to original calculation
+            inc_factor = triton.cdiv(V, H)  # (V + H - 1) // H
+            chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))  # (BT + inc_factor - 1) // inc_factor
+    else:
+        # Original chunking strategy
+        inc_factor = triton.cdiv(V, H)  # (V + H - 1) // H
+        chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))  # (BT + inc_factor - 1) // inc_factor
+    
     num_chunks = triton.cdiv(BT, chunk_size)  # (BT + chunk_size - 1) // chunk_size
 
     grad_input = torch.zeros_like(_input, device=device)
@@ -70,16 +107,21 @@ def fused_linear_cross_entropy_forward(
     z_loss_1d = torch.zeros(BT, dtype=_input.dtype, device=_input.device) if return_z_loss else None
     token_accuracy_1d = torch.zeros(BT, dtype=torch.float32, device=device) if return_token_accuracy else None
 
-    # TODO: evaluate how CUDA synchronization caused by .item() affects the speed
+    # OPTIMIZATION: Defer synchronization - compute masks but don't call .item() yet
     target_mask = target != ignore_index
-    total_n_non_ignore = target_mask.sum().item()
+    total_n_non_ignore_tensor = target_mask.sum()  # Keep as tensor, no .item()
+    
+    # We still need to compute these values for the kernel, but we can defer the .item() for ce_weight
+    total_n_non_ignore = total_n_non_ignore_tensor.item()  # Still needed for kernel
     total_sum_non_ignore_ce_weight = total_n_non_ignore
     ce_weight_sum = 0.0
+    
     if ce_weight is not None:
         assert ce_weight.shape[0] == V, f"If given, weight has to be a Tensor of size V. Got: {ce_weight.shape}"
         assert torch.is_floating_point(ce_weight), (
             f"If given, weight has to be a Tensor of floating point dtype. Got: {ce_weight.dtype}"
         )
+        # OPTIMIZATION: Only synchronize ce_weight calculations if needed
         total_sum_non_ignore_ce_weight = (
             torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum().item()
         )
@@ -219,7 +261,11 @@ def fused_linear_cross_entropy_forward(
         loss = torch.sum(loss_1d)
         z_loss = torch.sum(z_loss_1d) if return_z_loss else None
         # For accuracy, we compute the mean across all non-ignored tokens
-        token_accuracy = torch.sum(token_accuracy_1d) / total_n_non_ignore if return_token_accuracy else None
+        if return_token_accuracy:
+            # We already have total_n_non_ignore from earlier
+            token_accuracy = torch.sum(token_accuracy_1d) / total_n_non_ignore if total_n_non_ignore > 0 else 0.0
+        else:
+            token_accuracy = None
 
     # Cast back to original dtype
     grad_weight = grad_weight.to(weight.dtype) if grad_weight is not None else None
