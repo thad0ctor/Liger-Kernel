@@ -135,9 +135,21 @@ def fused_linear_cross_entropy_forward(
         _input_chunk = _input[start_idx:end_idx]  # chunk_size x H
 
         # when doing matmul, use the original precision
-        logits_chunk = _input_chunk @ weight.t()  # chunk_size x V
+        # Handle DTensor for FSDP2 compatibility
+        if hasattr(weight, '_local_tensor'):
+            # weight is a DTensor, use local tensor for computation
+            weight_local = weight._local_tensor
+        else:
+            weight_local = weight
+        
+        logits_chunk = _input_chunk @ weight_local.t()  # chunk_size x V
         if bias is not None:
-            logits_chunk = logits_chunk + bias
+            # Handle DTensor for bias as well
+            if hasattr(bias, '_local_tensor'):
+                bias_local = bias._local_tensor
+            else:
+                bias_local = bias
+            logits_chunk = logits_chunk + bias_local
 
         target_chunk = target[start_idx:end_idx]  # chunk_size,
 
