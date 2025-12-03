@@ -1,12 +1,19 @@
 import os
 import torch
 import triton
+import torch.distributed as dist
 
 from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
 from liger_kernel.ops.utils import amp_custom_bwd
 from liger_kernel.ops.utils import amp_custom_fwd
 from liger_kernel.ops.utils import element_mul_kernel
 from liger_kernel.ops.utils import is_hip
+
+# Import DTensor if available
+try:
+    from torch.distributed._tensor import DTensor
+except ImportError:
+    DTensor = None
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
@@ -58,7 +65,6 @@ def fused_linear_cross_entropy_forward(
         fsdp2_enabled = True
         # Try to get world size from torch.distributed if available
         try:
-            import torch.distributed as dist
             if dist.is_initialized():
                 fsdp2_world_size = dist.get_world_size()
         except:
@@ -89,16 +95,42 @@ def fused_linear_cross_entropy_forward(
     
     num_chunks = triton.cdiv(BT, chunk_size)  # (BT + chunk_size - 1) // chunk_size
 
+    # Handle DTensor for FSDP2 compatibility
+    weight_is_dtensor = DTensor is not None and isinstance(weight, DTensor)
+    bias_is_dtensor = DTensor is not None and isinstance(bias, DTensor) if bias is not None else False
+    
+    # Extract local tensors for computation
+    if weight_is_dtensor:
+        # weight is a DTensor, use local tensor for computation
+        weight_local = weight._local_tensor
+        # Store original DTensor reference for gradient reconstruction
+        original_weight_dtensor = weight
+    else:
+        weight_local = weight
+        original_weight_dtensor = None
+    
+    if bias is not None:
+        if bias_is_dtensor:
+            bias_local = bias._local_tensor
+            original_bias_dtensor = bias
+        else:
+            bias_local = bias
+            original_bias_dtensor = None
+    else:
+        bias_local = None
+        original_bias_dtensor = None
+
     grad_input = torch.zeros_like(_input, device=device)
 
     # we use fp32 for loss and gradients accumulator
     if input_requires_grad:
+        # Use local tensors for creating gradients to avoid DTensor issues
         if accum_dtype is None:
-            grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
-            grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
+            grad_weight = torch.zeros_like(weight_local, device=device) if weight.requires_grad else None
+            grad_bias = torch.zeros_like(bias_local, device=device) if bias_local is not None else None
         else:
-            grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight.requires_grad else None
-            grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None else None
+            grad_weight = torch.zeros_like(weight_local, dtype=accum_dtype, device=device) if weight.requires_grad else None
+            grad_bias = torch.zeros_like(bias_local, dtype=accum_dtype, device=device) if bias_local is not None else None
     else:
         grad_weight = None
         grad_bias = None
@@ -117,17 +149,26 @@ def fused_linear_cross_entropy_forward(
     ce_weight_sum = 0.0
     
     if ce_weight is not None:
-        assert ce_weight.shape[0] == V, f"If given, weight has to be a Tensor of size V. Got: {ce_weight.shape}"
-        assert torch.is_floating_point(ce_weight), (
-            f"If given, weight has to be a Tensor of floating point dtype. Got: {ce_weight.dtype}"
+        # Handle DTensor for ce_weight
+        if DTensor is not None and isinstance(ce_weight, DTensor):
+            ce_weight_local = ce_weight._local_tensor
+            if ce_weight_local.device != device:
+                ce_weight_local = ce_weight_local.to(device)
+        else:
+            ce_weight_local = ce_weight
+            
+        assert ce_weight_local.shape[0] == V, f"If given, weight has to be a Tensor of size V. Got: {ce_weight_local.shape}"
+        assert torch.is_floating_point(ce_weight_local), (
+            f"If given, weight has to be a Tensor of floating point dtype. Got: {ce_weight_local.dtype}"
         )
         # OPTIMIZATION: Only synchronize ce_weight calculations if needed
         total_sum_non_ignore_ce_weight = (
-            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum().item()
+            torch.gather(ce_weight_local, dim=0, index=target.masked_select(target_mask)).sum().item()
         )
-        ce_weight_sum = ce_weight.sum().item()
-        if ce_weight.stride(-1) != 1:
-            ce_weight = ce_weight.contiguous()
+        ce_weight_sum = ce_weight_local.sum().item()
+        if ce_weight_local.stride(-1) != 1:
+            ce_weight_local = ce_weight_local.contiguous()
+        ce_weight = ce_weight_local  # Use local version for the rest of the function
 
     for chunk_id in range(num_chunks):
         start_idx = chunk_id * chunk_size
@@ -135,26 +176,8 @@ def fused_linear_cross_entropy_forward(
         _input_chunk = _input[start_idx:end_idx]  # chunk_size x H
 
         # when doing matmul, use the original precision
-        # Handle DTensor for FSDP2 compatibility
-        if hasattr(weight, '_local_tensor'):
-            # weight is a DTensor, use local tensor for computation
-            weight_local = weight._local_tensor
-            # Ensure weight is on the same device as input
-            if weight_local.device != _input_chunk.device:
-                weight_local = weight_local.to(_input_chunk.device)
-        else:
-            weight_local = weight
-        
         logits_chunk = _input_chunk @ weight_local.t()  # chunk_size x V
-        if bias is not None:
-            # Handle DTensor for bias as well
-            if hasattr(bias, '_local_tensor'):
-                bias_local = bias._local_tensor
-                # Ensure bias is on the same device as input
-                if bias_local.device != _input_chunk.device:
-                    bias_local = bias_local.to(_input_chunk.device)
-            else:
-                bias_local = bias
+        if bias_local is not None:
             logits_chunk = logits_chunk + bias_local
 
         target_chunk = target[start_idx:end_idx]  # chunk_size,
@@ -252,7 +275,8 @@ def fused_linear_cross_entropy_forward(
             grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
 
         if input_requires_grad:
-            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
+            # Use the same weight_local we computed earlier
+            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight_local
 
         if grad_weight is not None and input_requires_grad:
             grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
@@ -289,7 +313,7 @@ def fused_linear_cross_entropy_forward(
     grad_weight = grad_weight.to(weight.dtype) if grad_weight is not None else None
     grad_bias = grad_bias.to(bias.dtype) if grad_bias is not None else None
 
-    return loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias
+    return loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias, weight_is_dtensor, bias_is_dtensor, original_weight_dtensor, original_bias_dtensor
 
 
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
@@ -384,7 +408,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         return_token_accuracy (bool): When `return_token_accuracy` is `True`, computes and returns per-token accuracy without materializing logits. Default: `False`
         """
 
-        loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_forward(
+        loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias, weight_is_dtensor, bias_is_dtensor, original_weight_dtensor, original_bias_dtensor = fused_linear_cross_entropy_forward(
             _input=_input,
             weight=weight,
             target=target,
@@ -405,9 +429,13 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             grad_input.detach(),
             grad_weight.detach() if grad_weight is not None else None,
             grad_bias.detach() if bias is not None else None,
+            original_weight_dtensor,
+            original_bias_dtensor,
         )
         ctx.return_z_loss = return_z_loss
         ctx.return_token_accuracy = return_token_accuracy
+        ctx.weight_is_dtensor = weight_is_dtensor
+        ctx.bias_is_dtensor = bias_is_dtensor
         return loss, z_loss, token_accuracy
 
     @staticmethod
@@ -417,10 +445,33 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             del grad_output2  # z_loss is only for logging
         if ctx.return_token_accuracy:
             del grad_output3  # token_accuracy is only for metrics
-        (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
+        grad_input, grad_weight, grad_bias, original_weight_dtensor, original_bias_dtensor = ctx.saved_tensors
         grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
             grad_output, grad_input, grad_weight, grad_bias
         )
+        
+        # Handle DTensor gradient reconstruction for FSDP2
+        # We need to wrap the local gradients back into DTensor format
+        if ctx.weight_is_dtensor and grad_weight is not None and original_weight_dtensor is not None:
+            # Reconstruct DTensor gradient from local gradient
+            # DTensor expects gradients that match the placement of the original tensor
+            from torch.distributed._tensor import DTensor
+            grad_weight = DTensor.from_local(
+                grad_weight,
+                original_weight_dtensor.device_mesh,
+                original_weight_dtensor.placements,
+                run_check=False
+            )
+            
+        if ctx.bias_is_dtensor and grad_bias is not None and original_bias_dtensor is not None:
+            from torch.distributed._tensor import DTensor
+            grad_bias = DTensor.from_local(
+                grad_bias,
+                original_bias_dtensor.device_mesh,
+                original_bias_dtensor.placements,
+                run_check=False
+            )
+            
         return (
             grad_input,
             grad_weight,
