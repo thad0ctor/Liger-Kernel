@@ -139,6 +139,9 @@ def fused_linear_cross_entropy_forward(
         if hasattr(weight, '_local_tensor'):
             # weight is a DTensor, use local tensor for computation
             weight_local = weight._local_tensor
+            # Ensure weight is on the same device as input
+            if weight_local.device != _input_chunk.device:
+                weight_local = weight_local.to(_input_chunk.device)
         else:
             weight_local = weight
         
@@ -147,6 +150,9 @@ def fused_linear_cross_entropy_forward(
             # Handle DTensor for bias as well
             if hasattr(bias, '_local_tensor'):
                 bias_local = bias._local_tensor
+                # Ensure bias is on the same device as input
+                if bias_local.device != _input_chunk.device:
+                    bias_local = bias_local.to(_input_chunk.device)
             else:
                 bias_local = bias
             logits_chunk = logits_chunk + bias_local
