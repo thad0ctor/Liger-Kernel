@@ -119,6 +119,14 @@ def causal_forward(
                 labels = labels.to(lm_head_device)
             if shift_labels is not None:
                 shift_labels = shift_labels.to(lm_head_device)
+        # HF Trainer >=4.46 passes ``num_items_in_batch`` (and potentially other
+        # metadata tensors) as a GPU scalar on hidden_states' device. Under
+        # device_map sharding that can be a different GPU than ``lm_head``, so
+        # forwarding the kwargs unchanged would land a stale-device tensor in
+        # the loss scaling path. Move any tensor kwargs to ``lm_head_device``.
+        for k, v in list(loss_kwargs.items()):
+            if isinstance(v, torch.Tensor) and v.device != lm_head_device:
+                loss_kwargs[k] = v.to(lm_head_device)
         result = LigerForCausalLMLoss(
             hidden_states=kept_hidden_states,
             lm_head_weight=self.lm_head.weight,
@@ -295,6 +303,14 @@ def multimodal_forward(
         if shift_hidden_states.device != lm_head_device:
             shift_hidden_states = shift_hidden_states.to(lm_head_device)
             shift_labels = shift_labels.to(lm_head_device)
+        # HF Trainer >=4.46 passes ``num_items_in_batch`` (and potentially other
+        # metadata tensors) as a GPU scalar on hidden_states' device. Under
+        # device_map sharding that can be a different GPU than ``lm_head``, so
+        # forwarding the kwargs unchanged would land a stale-device tensor in
+        # the loss scaling path. Move any tensor kwargs to ``lm_head_device``.
+        for k, v in list(lm_kwargs.items()):
+            if isinstance(v, torch.Tensor) and v.device != lm_head_device:
+                lm_kwargs[k] = v.to(lm_head_device)
 
         result = LigerForCausalLMLoss(
             hidden_states=shift_hidden_states,
