@@ -4,6 +4,7 @@ import triton.language as tl
 
 from liger_kernel.ops.utils import calculate_settings
 from liger_kernel.ops.utils import ensure_contiguous
+from liger_kernel.ops.utils import kernel_launch_device_ctx
 
 
 @triton.jit
@@ -68,15 +69,16 @@ def swiglu_forward(a, b):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _swiglu_forward_kernel[(n_rows,)](
-        a,
-        b,
-        c,
-        c.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with kernel_launch_device_ctx(a):
+        _swiglu_forward_kernel[(n_rows,)](
+            a,
+            b,
+            c,
+            c.stride(-2),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
     return a, b, c.view(*ori_shape)
 
 
@@ -88,15 +90,16 @@ def swiglu_backward(a, b, dc):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _swiglu_backward_kernel[(n_rows,)](
-        dc,
-        a,
-        b,
-        dc.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with kernel_launch_device_ctx(dc):
+        _swiglu_backward_kernel[(n_rows,)](
+            dc,
+            a,
+            b,
+            dc.stride(-2),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
     return a.view(*ori_shape), b.view(*ori_shape)
 
 

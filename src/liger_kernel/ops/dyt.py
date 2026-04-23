@@ -8,6 +8,7 @@ from liger_kernel.ops.utils import compare_version
 from liger_kernel.ops.utils import ensure_contiguous
 from liger_kernel.ops.utils import get_npu_core_count
 from liger_kernel.ops.utils import infer_device
+from liger_kernel.ops.utils import kernel_launch_device_ctx
 from liger_kernel.utils import is_npu_available
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
@@ -102,16 +103,17 @@ def liger_dyt_fwd(x, alpha, gamma, beta):
         kwargs = {"BLOCK_N": min(triton.next_power_of_2(N), 1024), "num_warps": 4, "num_stages": 1}
 
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)
-    _dyt_fwd_kernel[(grid)](
-        x,
-        y,
-        alpha,
-        gamma,
-        beta,
-        HAVE_BETA,
-        N,
-        **kwargs,
-    )
+    with kernel_launch_device_ctx(x):
+        _dyt_fwd_kernel[(grid)](
+            x,
+            y,
+            alpha,
+            gamma,
+            beta,
+            HAVE_BETA,
+            N,
+            **kwargs,
+        )
     return y.view(input_shape)
 
 
@@ -136,7 +138,8 @@ def liger_dyt_bwd(dy, x, alpha, gamma, beta):
 
     kwargs = {"BLOCK_N": min(triton.next_power_of_2(N), 1024), "num_warps": 8, "num_stages": 2}
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), NUM_SMS)
-    _dyt_bwd_kernel[grid](dy, dx, da, dg, db, x, alpha, gamma, HAVE_BETA, M, N, **kwargs)
+    with kernel_launch_device_ctx(dy):
+        _dyt_bwd_kernel[grid](dy, dx, da, dg, db, x, alpha, gamma, HAVE_BETA, M, N, **kwargs)
     if HAVE_BETA:
         db = db.sum(0).to(x.dtype)
     dg = dg.sum(0).to(gamma.dtype)

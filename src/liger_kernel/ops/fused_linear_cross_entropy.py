@@ -98,135 +98,137 @@ def fused_linear_cross_entropy_forward(
     # models sharded across GPUs via accelerate device_map, the input/weight
     # tensors may live on a non-default GPU and the kernel cannot access them.
     # Set the current device to match the input's GPU for the entire chunked
-    # loop so every kernel launch in here lands on the right context.
-    _launch_ctx = kernel_launch_device_ctx(_input)
-    _launch_ctx.__enter__()
-    for chunk_id in range(num_chunks):
-        start_idx = chunk_id * chunk_size
-        end_idx = min((chunk_id + 1) * chunk_size, BT)
-        _input_chunk = _input[start_idx:end_idx]  # chunk_size x H
+    # loop so every kernel launch in here lands on the right context. Use a
+    # ``with`` block so the context is restored even if an op inside the loop
+    # raises (e.g. OOM on the matmul, kernel error); otherwise
+    # ``torch.cuda.current_device()`` stays reassigned and corrupts subsequent
+    # ops in the process.
+    with kernel_launch_device_ctx(_input):
+        for chunk_id in range(num_chunks):
+            start_idx = chunk_id * chunk_size
+            end_idx = min((chunk_id + 1) * chunk_size, BT)
+            _input_chunk = _input[start_idx:end_idx]  # chunk_size x H
 
-        # when doing matmul, use the original precision
-        logits_chunk = _input_chunk @ weight.t()  # chunk_size x V
-        if bias is not None:
-            logits_chunk = logits_chunk + bias
+            # when doing matmul, use the original precision
+            logits_chunk = _input_chunk @ weight.t()  # chunk_size x V
+            if bias is not None:
+                logits_chunk = logits_chunk + bias
 
-        target_chunk = target[start_idx:end_idx]  # chunk_size,
+            target_chunk = target[start_idx:end_idx]  # chunk_size,
 
-        n_rows = logits_chunk.shape[0]
+            n_rows = logits_chunk.shape[0]
 
-        # Compute predicted probabilities for token scaling if needed
-        if use_token_scaling:
-            # Compute softmax probabilities for scaling
-            # We need to compute this before the cross entropy kernel modifies logits_chunk
-            logits_for_softmax = logits_chunk.detach().clone()  # Detach to avoid gradient flow
-            if softcap is not None:
-                logits_for_softmax = softcap * torch.tanh(logits_for_softmax / softcap)
+            # Compute predicted probabilities for token scaling if needed
+            if use_token_scaling:
+                # Compute softmax probabilities for scaling
+                # We need to compute this before the cross entropy kernel modifies logits_chunk
+                logits_for_softmax = logits_chunk.detach().clone()  # Detach to avoid gradient flow
+                if softcap is not None:
+                    logits_for_softmax = softcap * torch.tanh(logits_for_softmax / softcap)
 
-            # Compute softmax to get predicted probabilities
-            probs = torch.softmax(logits_for_softmax, dim=-1)
+                # Compute softmax to get predicted probabilities
+                probs = torch.softmax(logits_for_softmax, dim=-1)
 
-            # Get predicted probabilities for token scaling, handling ignored targets
-            valid_target_mask = target_chunk != ignore_index
-            valid_targets = target_chunk[valid_target_mask]
+                # Get predicted probabilities for token scaling, handling ignored targets
+                valid_target_mask = target_chunk != ignore_index
+                valid_targets = target_chunk[valid_target_mask]
 
-            if len(valid_targets) > 0:
-                # Gather probabilities only for valid targets
-                valid_probs = probs[valid_target_mask]
-                pred_probs_valid = torch.gather(valid_probs, -1, valid_targets.unsqueeze(-1)).squeeze(-1)
+                if len(valid_targets) > 0:
+                    # Gather probabilities only for valid targets
+                    valid_probs = probs[valid_target_mask]
+                    pred_probs_valid = torch.gather(valid_probs, -1, valid_targets.unsqueeze(-1)).squeeze(-1)
 
-                # Create full tensor with zeros for ignored targets
-                pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
-                pred_probs[valid_target_mask] = pred_probs_valid
-            else:
-                # All targets are ignored
-                pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+                    # Create full tensor with zeros for ignored targets
+                    pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+                    pred_probs[valid_target_mask] = pred_probs_valid
+                else:
+                    # All targets are ignored
+                    pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
 
-            # Store the scaling factors
-            scaling_factors = pred_probs.detach()  # Detach to ensure no gradient flow
+                # Store the scaling factors
+                scaling_factors = pred_probs.detach()  # Detach to ensure no gradient flow
 
-        # unreduced loss
-        loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
-        z_loss_1d_slice = z_loss_1d[start_idx:end_idx] if return_z_loss else None
-        token_accuracy_1d_slice = token_accuracy_1d[start_idx:end_idx] if return_token_accuracy else None
-        predicted_tokens_1d_slice = predicted_tokens_1d[start_idx:end_idx] if return_predicted_tokens else None
+            # unreduced loss
+            loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
+            z_loss_1d_slice = z_loss_1d[start_idx:end_idx] if return_z_loss else None
+            token_accuracy_1d_slice = token_accuracy_1d[start_idx:end_idx] if return_token_accuracy else None
+            predicted_tokens_1d_slice = predicted_tokens_1d[start_idx:end_idx] if return_predicted_tokens else None
 
-        # ensure _input and target are contiguous
-        logits_chunk = logits_chunk.contiguous()
-        target_chunk = target_chunk.contiguous()
+            # ensure _input and target are contiguous
+            logits_chunk = logits_chunk.contiguous()
+            target_chunk = target_chunk.contiguous()
 
-        # Here we calculate the gradient of logits_chunk in place so we can save memory.
-        liger_cross_entropy_kernel[(n_rows,)](
-            X_ptr=logits_chunk,
-            X_stride=logits_chunk.stride(-2),
-            Y_ptr=target_chunk,
-            Y_stride=target_chunk.stride(-1),  # always 1
-            weight_ptr=ce_weight,
-            loss_ptr=loss_1d_slice,
-            z_loss_ptr=z_loss_1d_slice,
-            loss_stride=loss_1d_slice.stride(-1),  # always 1
-            token_accuracy_ptr=token_accuracy_1d_slice,
-            token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
-            if return_token_accuracy
-            else 0,  # always 1 if accuracy is enabled
-            predicted_tokens_ptr=predicted_tokens_1d_slice,
-            predicted_tokens_stride=predicted_tokens_1d_slice.stride(-1)
-            if return_predicted_tokens
-            else 0,  # always 1 if predicted tokens is enabled
-            n_cols=V,
-            n_non_ignore=total_n_non_ignore,
-            sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
-            weight_sum=ce_weight_sum,
-            ignore_index=ignore_index,
-            lse_square_scale=lse_square_scale,
-            label_smoothing=label_smoothing,
-            reduction=reduction,
-            softcap=softcap,
-            RETURN_Z_LOSS=return_z_loss,
-            RETURN_TOKEN_ACCURACY=return_token_accuracy,
-            RETURN_PREDICTED_TOKENS=return_predicted_tokens,
-            HAS_WEIGHT=True if ce_weight is not None else False,
-            HAS_SOFTCAPPING=True if softcap is not None else False,
-            HAS_GRADIENTS=input_requires_grad,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
-
-        # Apply token scaling if requested
-        if use_token_scaling:
-            loss_1d_slice = loss_1d_slice * scaling_factors
-            if return_z_loss:
-                z_loss_1d_slice = z_loss_1d_slice * scaling_factors
-
-        loss_1d[start_idx:end_idx] = loss_1d_slice
-        if return_z_loss:
-            z_loss_1d[start_idx:end_idx] = z_loss_1d_slice
-        if return_token_accuracy:
-            token_accuracy_1d[start_idx:end_idx] = token_accuracy_1d_slice
-        if return_predicted_tokens:
-            predicted_tokens_1d[start_idx:end_idx] = predicted_tokens_1d_slice
-        grad_logits_chunk = logits_chunk  # chunk_size x V
-
-        # Apply token scaling to gradients if requested
-        if use_token_scaling:
-            # Expand scaling factors to match gradient dimensions
-            scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
-            grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
-
-        if input_requires_grad:
-            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
-
-        if grad_weight is not None and input_requires_grad:
-            grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
-
-        if bias is not None and input_requires_grad:
-            torch.add(
-                input=grad_bias,
-                other=grad_logits_chunk.sum(dim=0),
-                out=grad_bias,
-                alpha=1.0,
+            # Here we calculate the gradient of logits_chunk in place so we can save memory.
+            liger_cross_entropy_kernel[(n_rows,)](
+                X_ptr=logits_chunk,
+                X_stride=logits_chunk.stride(-2),
+                Y_ptr=target_chunk,
+                Y_stride=target_chunk.stride(-1),  # always 1
+                weight_ptr=ce_weight,
+                loss_ptr=loss_1d_slice,
+                z_loss_ptr=z_loss_1d_slice,
+                loss_stride=loss_1d_slice.stride(-1),  # always 1
+                token_accuracy_ptr=token_accuracy_1d_slice,
+                token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
+                if return_token_accuracy
+                else 0,  # always 1 if accuracy is enabled
+                predicted_tokens_ptr=predicted_tokens_1d_slice,
+                predicted_tokens_stride=predicted_tokens_1d_slice.stride(-1)
+                if return_predicted_tokens
+                else 0,  # always 1 if predicted tokens is enabled
+                n_cols=V,
+                n_non_ignore=total_n_non_ignore,
+                sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
+                weight_sum=ce_weight_sum,
+                ignore_index=ignore_index,
+                lse_square_scale=lse_square_scale,
+                label_smoothing=label_smoothing,
+                reduction=reduction,
+                softcap=softcap,
+                RETURN_Z_LOSS=return_z_loss,
+                RETURN_TOKEN_ACCURACY=return_token_accuracy,
+                RETURN_PREDICTED_TOKENS=return_predicted_tokens,
+                HAS_WEIGHT=True if ce_weight is not None else False,
+                HAS_SOFTCAPPING=True if softcap is not None else False,
+                HAS_GRADIENTS=input_requires_grad,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=32 if not is_hip() else 16,
             )
-    _launch_ctx.__exit__(None, None, None)
+
+            # Apply token scaling if requested
+            if use_token_scaling:
+                loss_1d_slice = loss_1d_slice * scaling_factors
+                if return_z_loss:
+                    z_loss_1d_slice = z_loss_1d_slice * scaling_factors
+
+            loss_1d[start_idx:end_idx] = loss_1d_slice
+            if return_z_loss:
+                z_loss_1d[start_idx:end_idx] = z_loss_1d_slice
+            if return_token_accuracy:
+                token_accuracy_1d[start_idx:end_idx] = token_accuracy_1d_slice
+            if return_predicted_tokens:
+                predicted_tokens_1d[start_idx:end_idx] = predicted_tokens_1d_slice
+            grad_logits_chunk = logits_chunk  # chunk_size x V
+
+            # Apply token scaling to gradients if requested
+            if use_token_scaling:
+                # Expand scaling factors to match gradient dimensions
+                scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
+                grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
+
+            if input_requires_grad:
+                grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
+
+            if grad_weight is not None and input_requires_grad:
+                grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
+
+            if bias is not None and input_requires_grad:
+                torch.add(
+                    input=grad_bias,
+                    other=grad_logits_chunk.sum(dim=0),
+                    out=grad_bias,
+                    alpha=1.0,
+                )
 
     # Need extra calculations for backward if reduction=='none'. Not supporting reduction='none' now.
     # if reduction == "none":

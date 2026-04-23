@@ -6,6 +6,7 @@ import triton.language as tl
 
 from liger_kernel.ops.utils import calculate_settings
 from liger_kernel.ops.utils import ensure_contiguous
+from liger_kernel.ops.utils import kernel_launch_device_ctx
 
 
 @triton.jit
@@ -121,16 +122,17 @@ def _softmax_forward(x: torch.Tensor) -> Tuple[torch.Tensor, int, int, bool]:
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
     y2d = torch.empty_like(x2d)
 
-    if n_cols <= BLOCK_SIZE:
-        _softmax_single_block_forward_kernel[(n_rows,)](
-            y2d, y2d.stride(0), x2d, x2d.stride(0), n_cols, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
-        )
-        multi_block_launch = False
-    else:
-        _softmax_multi_block_forward_kernel[(n_rows,)](
-            y2d, y2d.stride(0), x2d, x2d.stride(0), n_cols, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
-        )
-        multi_block_launch = True
+    with kernel_launch_device_ctx(x2d):
+        if n_cols <= BLOCK_SIZE:
+            _softmax_single_block_forward_kernel[(n_rows,)](
+                y2d, y2d.stride(0), x2d, x2d.stride(0), n_cols, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
+            )
+            multi_block_launch = False
+        else:
+            _softmax_multi_block_forward_kernel[(n_rows,)](
+                y2d, y2d.stride(0), x2d, x2d.stride(0), n_cols, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
+            )
+            multi_block_launch = True
 
     return y2d.view(*batch, n_cols), BLOCK_SIZE, num_warps, multi_block_launch
 
@@ -148,30 +150,31 @@ def _softmax_backward(
     n_rows = dy2d.shape[0]
     dx2d = torch.empty_like(dy2d)
 
-    if not multi_block_launch and n_cols <= BLOCK_SIZE:
-        _softmax_single_block_backward_kernel[(n_rows,)](
-            dy2d,
-            dy2d.stride(0),
-            y2d,
-            y2d.stride(0),
-            dx2d,
-            dx2d.stride(0),
-            n_cols,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-    else:
-        _softmax_multi_block_backward_kernel[(n_rows,)](
-            dy2d,
-            dy2d.stride(0),
-            y2d,
-            y2d.stride(0),
-            dx2d,
-            dx2d.stride(0),
-            n_cols,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
+    with kernel_launch_device_ctx(dy2d):
+        if not multi_block_launch and n_cols <= BLOCK_SIZE:
+            _softmax_single_block_backward_kernel[(n_rows,)](
+                dy2d,
+                dy2d.stride(0),
+                y2d,
+                y2d.stride(0),
+                dx2d,
+                dx2d.stride(0),
+                n_cols,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
+            )
+        else:
+            _softmax_multi_block_backward_kernel[(n_rows,)](
+                dy2d,
+                dy2d.stride(0),
+                y2d,
+                y2d.stride(0),
+                dx2d,
+                dx2d.stride(0),
+                n_cols,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
+            )
 
     return dx2d.view(*batch, n_cols)
 
