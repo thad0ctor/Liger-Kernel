@@ -806,6 +806,61 @@ if GEMMA4_AVAILABLE:
         ),
     )
 
+    # E2B-it variant: enables the three Phase A knobs that distinguish Gemma 4
+    # E2B-it from the 31B-it dense stack — double-wide MLP on kv-shared layers,
+    # kv-sharing for the trailing `num_kv_shared_layers` layers, and per-layer
+    # embeddings (PLE). Layer types carry a full_attention at idx 2 so the
+    # kv-shared full layer at idx 5 has a same-type donor in the non-shared
+    # prefix (the donor-lookup in modeling_gemma4 searches layer_types[:3] for
+    # the matching type).
+    MINI_MODEL_SETUPS["mini_gemma4_text_e2b"] = MiniModelConfig(
+        liger_kernel_patch_func=apply_liger_kernel_to_gemma4_text,
+        liger_kernel_patch_revert_func=revert_liger_kernel_to_gemma4_text,
+        model_class=Gemma4ForCausalLM,
+        mini_model_config=Gemma4TextConfig(
+            vocab_size=32000,
+            hidden_size=256,
+            intermediate_size=384,  # shared layers get 2x = 768 via use_double_wide_mlp
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=64,
+            hidden_activation="gelu_pytorch_tanh",
+            max_position_embeddings=8192,
+            initializer_range=0.02,
+            rms_norm_eps=1e-06,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=2,
+            eos_token_id=1,
+            tie_word_embeddings=True,
+            attention_bias=False,
+            attention_dropout=0.0,
+            attn_implementation="eager",
+            final_logit_softcapping=30.0,
+            sliding_window=1024,
+            # Donor-safe layout: idx 2 is full_attention (non-shared) so the
+            # kv-shared full layer at idx 5 can locate a same-type predecessor.
+            # Sliding shared layers at idx 3,4 resolve to the sliding donor at
+            # idx 1.
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            # E2B Phase A knobs:
+            num_kv_shared_layers=3,  # layers 3,4,5 share k/v from earlier same-type layers
+            use_double_wide_mlp=True,  # 2x intermediate_size on shared layers
+            enable_moe_block=False,
+            hidden_size_per_layer_input=32,  # PLE width
+            vocab_size_per_layer_input=32000,
+            attention_k_eq_v=False,  # E2B-it: per task spec
+        ),
+    )
+
 
 if MLLAMA_AVAILABLE:
     MINI_MODEL_SETUPS["mini_mllama"] = MiniModelConfig(
@@ -2295,6 +2350,25 @@ def run_mini_model(
             5e-2,  # loss_atol — 6-layer mini in bf16 drifts ~0.05 on a few steps (vs 4-layer gemma3 which fits 1e-2)
             1e-2,
             5e-1,  # logprobs_atol — 3 of ~20k top-k logprob slots flip by ~0.5 due to bf16 near-ties
+            1e-2,
+            1e-2,
+            1e-2,
+            marks=[
+                pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+                pytest.mark.skipif(
+                    not GEMMA4_AVAILABLE,
+                    reason="Gemma4 not available in this version of transformers",
+                ),
+            ],
+        ),
+        pytest.param(
+            "mini_gemma4_text_e2b",
+            32,
+            1e-5,
+            torch.bfloat16,
+            5e-2,  # loss_atol — same as mini_gemma4_text; bf16 drift on a 6-layer mini
+            1e-2,
+            5e-1,  # logprobs_atol — same as mini_gemma4_text; bf16 near-tie flips
             1e-2,
             1e-2,
             1e-2,

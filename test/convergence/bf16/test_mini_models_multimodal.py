@@ -585,6 +585,67 @@ if GEMMA4_AVAILABLE:
         ),
     )
 
+    # E2B-it variant of the multimodal mini_gemma4 setup: enables the same
+    # Phase A text knobs exercised by mini_gemma4_text_e2b in the text-only
+    # suite (use_double_wide_mlp, num_kv_shared_layers, hidden_size_per_layer_input)
+    # while reusing the vision_config from mini_gemma4. audio_config is pinned
+    # off — Phase A does not cover audio.
+    MINI_MODEL_SETUPS["mini_gemma4_e2b"] = MiniModelConfig(
+        liger_kernel_patch_func=functools.partial(apply_liger_kernel_to_gemma4, fused_linear_cross_entropy=False),
+        liger_kernel_patch_revert_func=revert_liger_kernel_to_gemma4,
+        model_class=Gemma4ForConditionalGeneration,
+        mini_model_config=Gemma4Config(
+            text_config=Gemma4TextConfig(
+                vocab_size=32000,
+                hidden_size=256,
+                intermediate_size=384,  # shared layers get 2x = 768
+                num_hidden_layers=6,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                head_dim=64,
+                # Donor-safe layer layout — mirrors mini_gemma4_text_e2b.
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                num_kv_shared_layers=3,
+                use_double_wide_mlp=True,
+                enable_moe_block=False,
+                hidden_size_per_layer_input=32,
+                vocab_size_per_layer_input=32000,
+                attention_k_eq_v=False,
+                final_logit_softcapping=30.0,
+                rms_norm_eps=1e-5,
+            ),
+            vision_config=Gemma4VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=16,
+                rms_norm_eps=1e-5,
+                use_clipped_linears=False,
+                standardize=False,
+                patch_size=16,
+                pooling_kernel_size=3,
+                position_embedding_size=256,
+            ),
+            audio_config=None,
+            image_token_id=5,
+            video_token_id=6,
+            audio_token_id=7,
+            boi_token_id=4,
+            eoi_token_id=8,
+            boa_token_id=9,
+            eoa_token_index=10,
+        ),
+    )
+
 if QWEN2_VL_AVAILABLE:
     MINI_MODEL_SETUPS["mini_qwen2_vl"] = MiniModelConfig(
         liger_kernel_patch_func=functools.partial(apply_liger_kernel_to_qwen2_vl, fused_linear_cross_entropy=False),
@@ -1310,7 +1371,7 @@ def create_multimodal_dataset(model_name: str):
                 return_tensors="pt",
             )
             return {**text_inputs, **image_inputs}
-        elif model_name == "mini_gemma4":
+        elif model_name.startswith("mini_gemma4"):
             # Gemma 4 vision-only: hand-construct per-row batch fields.
             # `.map(preprocess_function)` is called WITHOUT batched=True, so
             # `examples` is a single-row dict, not a batch. Each row yields
@@ -1319,8 +1380,10 @@ def create_multimodal_dataset(model_name: str):
             # down to 4 soft tokens. Per-row tensor shapes carry an image
             # batch dim of 1 so the DataLoader collate_fn's torch.cat along
             # dim 0 produces the [B, num_patches, ...] the vision model
-            # expects.
-            gemma4_cfg = MINI_MODEL_SETUPS["mini_gemma4"].mini_model_config
+            # expects. Covers both `mini_gemma4` (dense text stack) and
+            # `mini_gemma4_e2b` (E2B Phase A text knobs) since the vision
+            # config is identical.
+            gemma4_cfg = MINI_MODEL_SETUPS[model_name].mini_model_config
             vision_cfg = gemma4_cfg.vision_config
             patch_size = vision_cfg.patch_size  # 16
             patches_per_side = 6
@@ -1745,6 +1808,28 @@ def run_mini_model_multimodal(
             torch.bfloat16,
             # Tolerances mirror mini_gemma3. If LUMI runs show drift (as with
             # the text-only Gemma 4 port), widen loss_atol/logprobs_atol here.
+            5e-2,
+            5e-2,
+            1e-1,
+            1e-1,
+            1e-2,
+            1e-2,
+            marks=[
+                pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+                pytest.mark.skipif(
+                    not GEMMA4_AVAILABLE,
+                    reason="Gemma4 not available in this version of transformers",
+                ),
+            ],
+        ),
+        pytest.param(
+            "mini_gemma4_e2b",
+            32,
+            1e-5,
+            torch.bfloat16,
+            # Same tolerances as mini_gemma4; the E2B text knobs (PLE, kv-share,
+            # double-wide MLP) swap structurally distinct modules but the
+            # per-step numeric drift envelope is the same shape at this scale.
             5e-2,
             5e-2,
             1e-1,
