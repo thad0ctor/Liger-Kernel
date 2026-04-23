@@ -1286,7 +1286,12 @@ def apply_liger_kernel_to_gemma4_text(
 
     # The user's text-only extraction loads as Gemma4TextForCausalLM
     # (custom subclass, not in mainline HF). Grab it if present.
+    # Guard against test mocks: getattr on a patched MagicMock returns
+    # another MagicMock (not None), which would poison the downstream
+    # isinstance() tuple with "arg 2 must be a type".
     Gemma4TextForCausalLM = getattr(modeling_gemma4, "Gemma4TextForCausalLM", None)
+    if not isinstance(Gemma4TextForCausalLM, type):
+        Gemma4TextForCausalLM = None
 
     # Gemma4RMSNorm uses ones-init, no +1 offset, fp32 compute.
     # offset=0.0 + casting_mode="gemma" is deliberate: the "gemma" path upcasts
