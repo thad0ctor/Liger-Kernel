@@ -15,6 +15,7 @@ from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from liger_kernel.transformers.functional import liger_cross_entropy
 from liger_kernel.transformers.geglu import LigerGEGLUMLP
 from liger_kernel.transformers.geglu import LigerGEGLUMLPForGemma4
+from liger_kernel.transformers.geglu import LigerGEGLUMLPForGemma4Vision
 from liger_kernel.transformers.layer_norm import LigerLayerNorm
 from liger_kernel.transformers.model.falcon_h1 import lce_forward as falcon_h1_lce_forward
 from liger_kernel.transformers.model.gemma import lce_forward as gemma_lce_forward
@@ -1387,6 +1388,145 @@ def apply_liger_kernel_to_gemma4_text(
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "v_norm", None))
         else:
             raise TypeError("The model must be Gemma4ForCausalLM, Gemma4TextForCausalLM, or Gemma4TextModel.")
+
+
+def apply_liger_kernel_to_gemma4(
+    rope: bool = True,
+    cross_entropy: bool = False,
+    fused_linear_cross_entropy: bool = True,
+    layer_norm: bool = True,  # no-op, kept for API parity with gemma3
+    rms_norm: bool = True,
+    geglu: bool = True,
+    model: PreTrainedModel = None,
+) -> None:
+    """
+    Apply Liger kernels to replace original implementation in HuggingFace Gemma4
+    multimodal models (``Gemma4ForConditionalGeneration``).
+
+    Vision-only scope: this entry point assumes the model was built with
+    ``audio_config=None`` — the audio tower is ``None`` and no audio kernels are
+    swapped. Calling this on a model with an active audio tower will leave the
+    audio half untouched (no warnings are emitted; the vision + text halves
+    still benefit from Liger).
+
+    Patching delegates the language-model half to
+    ``apply_liger_kernel_to_gemma4_text`` and additionally swaps vision-side
+    RMSNorms and GEGLU MLPs.
+
+    Args:
+        rope (bool): Reserved for API parity. Currently a no-op on both text and
+            vision halves of Gemma 4 — HF's ``apply_rotary_pos_emb`` uses a
+            single-tensor signature that is incompatible with Liger's
+            ``liger_rotary_pos_emb``. The text-path warning is emitted once.
+            Default True.
+        cross_entropy (bool): Whether to apply Liger's cross entropy loss.
+            Gemma4 routes loss through ``self.loss_function``; this flag is
+            kept for API parity with other patches. Default False.
+        fused_linear_cross_entropy (bool): Whether to apply Liger's fused linear
+            cross entropy loss. Cannot be True simultaneously with
+            ``cross_entropy``. Default True.
+        layer_norm (bool): No-op for Gemma 4 (vision stack uses ``Gemma4RMSNorm``
+            exclusively, there is no ``nn.LayerNorm`` to swap). Retained for
+            API parity with ``apply_liger_kernel_to_gemma3``. Default True.
+        rms_norm (bool): Whether to apply Liger's RMSNorm to vision layers and
+            the embed-vision projection norm. Default True.
+        geglu (bool): Whether to apply Liger's GEGLU MLP to vision layers.
+            Default True.
+        model (PreTrainedModel): An already-instantiated
+            ``Gemma4ForConditionalGeneration`` instance to patch in-place.
+            Default None (class-level patches only).
+    """
+    assert not (cross_entropy and fused_linear_cross_entropy), (
+        "cross_entropy and fused_linear_cross_entropy cannot both be True."
+    )
+
+    from transformers.models.gemma4 import modeling_gemma4
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionEncoderLayer
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionModel
+
+    from liger_kernel.transformers.model.gemma4 import multimodal_forward
+
+    # Mirrors the partial defined inside apply_liger_kernel_to_gemma4_text.
+    # Gemma4RMSNorm uses ones-init with no +1 offset, fp32 compute; Liger's
+    # "gemma" casting_mode upcasts to fp32, offset=0.0 yields w*x semantics.
+    _patch_rms_norm_module_for_gemma4 = partial(
+        _patch_rms_norm_module, offset=0.0, casting_mode="gemma", in_place=False
+    )
+
+    def _maybe_patch_scaled_norm(module):
+        """Patch only Gemma4RMSNorm modules that carry a weight.
+
+        Vision attention's ``v_norm`` and ``embed_vision.embedding_pre_projection_norm``
+        are instantiated with ``with_scale=False`` — no weight exists so Liger's
+        weight-multiplying kernel cannot apply. HF's scale-free RMSNorm stays in
+        place for those.
+        """
+        if module is None:
+            return
+        if not getattr(module, "with_scale", True):
+            return
+        _patch_rms_norm_module_for_gemma4(module)
+
+    # Delegate the language-model half. We pass cross_entropy=False /
+    # fused_linear_cross_entropy=False because the multimodal-level forward
+    # handles both — just like apply_liger_kernel_to_gemma3 does.
+    apply_liger_kernel_to_gemma4_text(
+        rope=rope, cross_entropy=False, fused_linear_cross_entropy=False, rms_norm=rms_norm, geglu=geglu
+    )
+
+    if model is None and geglu:
+        modeling_gemma4.Gemma4VisionMLP = LigerGEGLUMLPForGemma4Vision
+
+    if cross_entropy:
+        # API parity — Gemma4 uses ``self.loss_function(...)`` so this is
+        # mostly a no-op in practice.
+        modeling_gemma4.nn.CrossEntropyLoss = LigerCrossEntropyLoss
+
+    if fused_linear_cross_entropy:
+        if model is not None:
+            model.forward = MethodType(multimodal_forward, model)
+        else:
+            modeling_gemma4.Gemma4ForConditionalGeneration.forward = multimodal_forward
+
+    if model is not None:
+        # The model instance already exists, so we need to additionally patch the
+        # instance variables that reference already-instantiated modules
+
+        if not isinstance(model, Gemma4ForConditionalGeneration):
+            raise TypeError("The model must be Gemma4ForConditionalGeneration.")
+
+        if isinstance(model.model.vision_tower, Gemma4VisionModel):
+            for layer in model.model.vision_tower.encoder.layers:
+                layer: Gemma4VisionEncoderLayer
+                if geglu:
+                    _bind_method_to_module(layer.mlp, "forward", LigerGEGLUMLPForGemma4Vision.forward)
+                if rms_norm:
+                    _maybe_patch_scaled_norm(layer.input_layernorm)
+                    _maybe_patch_scaled_norm(layer.post_attention_layernorm)
+                    _maybe_patch_scaled_norm(layer.pre_feedforward_layernorm)
+                    _maybe_patch_scaled_norm(layer.post_feedforward_layernorm)
+                    # q_norm / k_norm are scaled; v_norm is with_scale=False so
+                    # _maybe_patch_scaled_norm intentionally leaves it alone.
+                    _maybe_patch_scaled_norm(getattr(layer.self_attn, "q_norm", None))
+                    _maybe_patch_scaled_norm(getattr(layer.self_attn, "k_norm", None))
+                    _maybe_patch_scaled_norm(getattr(layer.self_attn, "v_norm", None))
+
+        if rms_norm and getattr(model.model, "embed_vision", None) is not None:
+            # embed_vision.embedding_pre_projection_norm is with_scale=False on
+            # Gemma 4; _maybe_patch_scaled_norm gracefully skips it. The helper
+            # is still called so future variants that flip with_scale=True are
+            # picked up automatically.
+            _maybe_patch_scaled_norm(model.model.embed_vision.embedding_pre_projection_norm)
+
+        apply_liger_kernel_to_gemma4_text(
+            rope=rope,
+            cross_entropy=False,
+            fused_linear_cross_entropy=False,
+            rms_norm=rms_norm,
+            geglu=geglu,
+            model=model.model.language_model,
+        )
 
 
 def apply_liger_kernel_to_paligemma(
@@ -3334,6 +3474,7 @@ MODEL_TYPE_TO_APPLY_LIGER_FN = {
     "gemma3_text": apply_liger_kernel_to_gemma3_text,
     "gemma3": apply_liger_kernel_to_gemma3,
     "gemma4_text": apply_liger_kernel_to_gemma4_text,
+    "gemma4": apply_liger_kernel_to_gemma4,
     "glm4": apply_liger_kernel_to_glm4,
     "glm4v": apply_liger_kernel_to_glm4v,
     "glm4v_moe": apply_liger_kernel_to_glm4v_moe,
