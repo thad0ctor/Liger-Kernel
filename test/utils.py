@@ -519,6 +519,24 @@ def revert_liger_kernel_to_gemma3(model_config: MiniModelConfig):
     print("Liger kernel patches have been reverted.")
 
 
+def revert_liger_kernel_to_gemma4(model_config: MiniModelConfig):
+    """Revert all Liger kernel patches applied to Gemma4 (vision + text).
+
+    Gemma 4's vision tower is native to the gemma4 module (unlike Gemma 3 which
+    reuses SigLIP), so only `modeling_gemma4` needs reloading to reset the
+    class-level swaps (Gemma4RMSNorm, Gemma4TextMLP, Gemma4VisionMLP, and the
+    per-encoder layernorms) back to the original HF classes.
+    """
+
+    from transformers.models.gemma4 import modeling_gemma4
+
+    importlib.reload(modeling_gemma4)
+
+    model_config.model_class = modeling_gemma4.Gemma4ForConditionalGeneration
+
+    print("Liger kernel patches have been reverted.")
+
+
 def revert_liger_kernel_to_Paligemma(model_config: MiniModelConfig):
     """
     Revert all Liger kernel patches applied to Paligemma.

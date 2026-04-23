@@ -459,9 +459,9 @@ def test_patching_apis_support_patching_model_instance():
     for func in patching_functions:
         sig = inspect.signature(func)
         # Ensure 'model' is in the parameters
-        assert "model" in sig.parameters, (
-            f"{func.__name__} does not have 'model' as an argument. All patching methods must support patching an existing model instance."
-        )
+        assert (
+            "model" in sig.parameters
+        ), f"{func.__name__} does not have 'model' as an argument. All patching methods must support patching an existing model instance."
 
 
 def test_apply_liger_kernel_to_instance_for_llama():
@@ -1937,6 +1937,170 @@ def test_apply_liger_kernel_to_instance_for_gemma4_text():
             print(dummy_model_instance)
         except Exception as e:
             pytest.fail(f"An exception occured in extra_expr: {type(e).__name__} - {e}")
+
+
+@pytest.mark.skipif(not is_gemma4_available(), reason="gemma4 module not available")
+def test_apply_liger_kernel_to_instance_for_gemma4_conditional_generation():
+    # Vision-only multimodal path (audio_config=None). Structured after
+    # test_apply_liger_kernel_to_instance_for_gemma3_conditional_generation.
+    #
+    # Note: unlike the gemma4_text test we deliberately do *not* wrap this in
+    # `patch("transformers.models.gemma4.modeling_gemma4")`. That patch replaces
+    # the `modeling_gemma4` attribute on the parent package with a MagicMock
+    # for the duration of the test. When `apply_liger_kernel_to_gemma4`
+    # delegates to `apply_liger_kernel_to_gemma4_text(model=language_model)`,
+    # the nested function does `from transformers.models.gemma4 import
+    # modeling_gemma4` (mocked => MagicMock) then
+    # `getattr(modeling_gemma4, "Gemma4TextForCausalLM", None)` which returns
+    # a MagicMock rather than None. The subsequent
+    # `isinstance(language_model, (Gemma4ForCausalLM, <MagicMock>))` then fails
+    # because MagicMock is not a type. Reload the module manually at the end
+    # instead to roll back the class-level kernel swaps.
+    import importlib
+
+    from transformers.models.gemma4 import modeling_gemma4 as _modeling_gemma4
+
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
+
+        from liger_kernel.transformers.geglu import LigerGEGLUMLPForGemma4Vision
+        from liger_kernel.transformers.model.gemma4 import multimodal_forward as gemma4_multimodal_forward
+
+        # Build a tiny text config with every novel Gemma 4 knob pinned off
+        # so the test exercises the plain dense LM path.
+        text_config = transformers.models.gemma4.configuration_gemma4.Gemma4TextConfig(
+            dtype=torch.bfloat16,
+            rms_norm_eps=1e-5,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            num_kv_shared_layers=0,
+            use_double_wide_mlp=False,
+            enable_moe_block=False,
+            hidden_size_per_layer_input=0,
+        )
+        # Vision config mirrors the 31B defaults minus the pieces the test
+        # does not exercise (weight-clipped linears are off).
+        vision_config = transformers.models.gemma4.configuration_gemma4.Gemma4VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            use_clipped_linears=False,
+            standardize=False,
+            patch_size=16,
+            pooling_kernel_size=3,
+            position_embedding_size=256,
+        )
+        gemma4_config = transformers.models.gemma4.configuration_gemma4.Gemma4Config(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=None,
+        )
+
+        dummy_model_instance = Gemma4ForConditionalGeneration(gemma4_config)
+        assert isinstance(dummy_model_instance, Gemma4ForConditionalGeneration)
+        # audio_config=None ⇒ no audio tower. This test is vision-only.
+        assert dummy_model_instance.model.audio_tower is None
+
+        vision_tower = dummy_model_instance.model.vision_tower
+        embed_vision = dummy_model_instance.model.embed_vision
+        language_model = dummy_model_instance.model.language_model
+
+        # --- Pre-patch: no Liger modules installed ---
+        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(gemma4_multimodal_forward)
+
+        for layer in vision_tower.encoder.layers:
+            assert inspect.getsource(layer.mlp.forward) != inspect.getsource(LigerGEGLUMLPForGemma4Vision.forward)
+            assert inspect.getsource(layer.input_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.pre_feedforward_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_feedforward_layernorm.forward) != inspect.getsource(
+                LigerRMSNorm.forward
+            )
+            assert inspect.getsource(layer.self_attn.q_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.self_attn.k_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            # v_norm is scale-free (with_scale=False); must stay unpatched both pre- and post-.
+            assert inspect.getsource(layer.self_attn.v_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+
+        # embed_vision.embedding_pre_projection_norm is scale-free (with_scale=False)
+        # and therefore must remain unpatched after apply as well.
+        assert inspect.getsource(embed_vision.embedding_pre_projection_norm.forward) != inspect.getsource(
+            LigerRMSNorm.forward
+        )
+
+        # `language_model` on Gemma4Model is a Gemma4TextModel (a bare HF
+        # decoder stack) so its norm and decoder layers live directly under
+        # `language_model`, not `language_model.model`.
+        assert inspect.getsource(language_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in language_model.layers:
+            assert inspect.getsource(layer.mlp.forward) != inspect.getsource(LigerGEGLUMLP.forward)
+            assert inspect.getsource(layer.input_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.pre_feedforward_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_feedforward_layernorm.forward) != inspect.getsource(
+                LigerRMSNorm.forward
+            )
+            assert inspect.getsource(layer.self_attn.q_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.self_attn.k_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+
+        # --- Apply kernels to the instance ---
+        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+
+        # --- Post-patch: scaled norms, GEGLU, and multimodal forward swapped in ---
+        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(gemma4_multimodal_forward)
+
+        for layer in vision_tower.encoder.layers:
+            assert inspect.getsource(layer.mlp.forward) == inspect.getsource(LigerGEGLUMLPForGemma4Vision.forward)
+            assert inspect.getsource(layer.input_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_attention_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.pre_feedforward_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_feedforward_layernorm.forward) == inspect.getsource(
+                LigerRMSNorm.forward
+            )
+            assert inspect.getsource(layer.self_attn.q_norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.self_attn.k_norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            # v_norm is scale-free; _maybe_patch_scaled_norm skips it.
+            assert inspect.getsource(layer.self_attn.v_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+
+        # embed_vision.embedding_pre_projection_norm is scale-free too, so it must
+        # stay on HF's forward after apply.
+        assert inspect.getsource(embed_vision.embedding_pre_projection_norm.forward) != inspect.getsource(
+            LigerRMSNorm.forward
+        )
+
+        assert inspect.getsource(language_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in language_model.layers:
+            assert inspect.getsource(layer.mlp.forward) == inspect.getsource(LigerGEGLUMLP.forward)
+            assert inspect.getsource(layer.input_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_attention_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.pre_feedforward_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.post_feedforward_layernorm.forward) == inspect.getsource(
+                LigerRMSNorm.forward
+            )
+            assert inspect.getsource(layer.self_attn.q_norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            assert inspect.getsource(layer.self_attn.k_norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+            v_norm = getattr(layer.self_attn, "v_norm", None)
+            if v_norm is not None:
+                assert inspect.getsource(v_norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+
+        try:
+            print(dummy_model_instance)
+        except Exception as e:
+            pytest.fail(f"An exception occured in extra_expr: {type(e).__name__} - {e}")
+    finally:
+        # Roll back the class-level kernel swaps applied to `modeling_gemma4`
+        # (Gemma4RMSNorm, Gemma4TextMLP, Gemma4VisionMLP, etc.) so subsequent
+        # tests see a pristine module. This mirrors what `patch(...)` would
+        # have done, minus the mock-based side effects that broke the nested
+        # apply_liger_kernel_to_gemma4_text call.
+        importlib.reload(_modeling_gemma4)
 
 
 def test_apply_liger_kernel_to_instance_for_qwen2():

@@ -13,6 +13,7 @@ from transformers import PreTrainedTokenizerFast
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 
 from liger_kernel.transformers import apply_liger_kernel_to_gemma3
+from liger_kernel.transformers import apply_liger_kernel_to_gemma4
 from liger_kernel.transformers import apply_liger_kernel_to_internvl
 from liger_kernel.transformers import apply_liger_kernel_to_llama4
 from liger_kernel.transformers import apply_liger_kernel_to_llava
@@ -39,6 +40,7 @@ from test.utils import load_tokenizer_config
 from test.utils import multimodal_collate_fn
 from test.utils import require_deterministic
 from test.utils import revert_liger_kernel_to_gemma3
+from test.utils import revert_liger_kernel_to_gemma4
 from test.utils import revert_liger_kernel_to_internvl
 from test.utils import revert_liger_kernel_to_llama4
 from test.utils import revert_liger_kernel_to_llava
@@ -197,6 +199,17 @@ try:
     GEMMA3_AVAILABLE = True
 except ImportError:
     GEMMA3_AVAILABLE = False
+
+try:
+    # Gemma4 vision-only path. Native Gemma4 vision tower (not SigLIP).
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
+
+    GEMMA4_AVAILABLE = True
+except ImportError:
+    GEMMA4_AVAILABLE = False
 
 try:
     from transformers.models.llama4.configuration_llama4 import Llama4Config
@@ -514,6 +527,61 @@ if GEMMA3_AVAILABLE:
             boi_token_index=4,
             eoi_token_index=6,
             attn_implementation="eager",
+        ),
+    )
+
+if GEMMA4_AVAILABLE:
+    # Vision-only Gemma 4. Novel Gemma 4 text knobs (MoE, KV sharing, PLE,
+    # double-wide MLP) are all pinned off so the LM half reduces to the same
+    # dense stack exercised by mini_gemma3. use_clipped_linears=False picks
+    # the fast GEGLU path for the vision MLP. `vocab_size=32000` matches the
+    # gemma3 fake_configs tokenizer reused in the dispatch chain;
+    # `image_token_id=5` overlaps a real token id in that vocab so the
+    # `input_ids` scatter in Gemma4Model.forward has something to mask-scatter
+    # into. pooling_kernel_size=3 with a 6x6 (96x96) patch grid pools down to
+    # a 2x2 = 4 soft-token output, matching the number of image placeholders
+    # the synthetic preprocess_function inserts into each example.
+    MINI_MODEL_SETUPS["mini_gemma4"] = MiniModelConfig(
+        liger_kernel_patch_func=functools.partial(apply_liger_kernel_to_gemma4, fused_linear_cross_entropy=False),
+        liger_kernel_patch_revert_func=revert_liger_kernel_to_gemma4,
+        model_class=Gemma4ForConditionalGeneration,
+        mini_model_config=Gemma4Config(
+            text_config=Gemma4TextConfig(
+                vocab_size=32000,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=16,
+                num_kv_shared_layers=0,
+                use_double_wide_mlp=False,
+                enable_moe_block=False,
+                hidden_size_per_layer_input=0,
+                rms_norm_eps=1e-5,
+            ),
+            vision_config=Gemma4VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=16,
+                rms_norm_eps=1e-5,
+                use_clipped_linears=False,
+                standardize=False,
+                patch_size=16,
+                pooling_kernel_size=3,
+                position_embedding_size=256,
+            ),
+            audio_config=None,
+            image_token_id=5,
+            video_token_id=6,
+            audio_token_id=7,
+            boi_token_id=4,
+            eoi_token_id=8,
+            boa_token_id=9,
+            eoa_token_index=10,
         ),
     )
 
@@ -1164,6 +1232,35 @@ def create_processor(model_name: str):
         image_processor = Gemma3ImageProcessor()
         return Gemma3Processor(image_processor=image_processor, tokenizer=fast_tokenizer)
 
+    elif model_name.startswith("mini_gemma4"):
+        # Gemma 4 has no fake_configs entry of its own and we deliberately avoid
+        # depending on Gemma4ImageProcessor (which requires PIL-stage 2D tiling
+        # logic). Reuse the Gemma 3 tokenizer only — the vision batch is
+        # hand-constructed in preprocess_function and the chat template's image
+        # placeholder is post-processed to match Gemma 4's image_token_id.
+        tokenizer_config = load_tokenizer_config(
+            os.path.join(
+                FAKE_CONFIGS_PATH,
+                "Google/Gemma3/gemma-3-4b-it/tokenizer_config.json",
+            )
+        )
+        tokenizer_base = train_bpe_tokenizer(
+            [
+                token.content
+                for key, token in sorted(
+                    tokenizer_config["added_tokens_decoder"].items(),
+                    key=lambda x: int(x[0]),
+                )
+            ]
+        )
+        fast_tokenizer = GemmaTokenizer(tokenizer_object=tokenizer_base, **tokenizer_config)
+        # Wrap in a Gemma3Processor purely to satisfy the
+        # `processor.tokenizer.apply_chat_template(...)` call in
+        # `apply_chat_template`. The image processor is never invoked for
+        # mini_gemma4; preprocess_function short-circuits below.
+        image_processor = Gemma3ImageProcessor()
+        return Gemma3Processor(image_processor=image_processor, tokenizer=fast_tokenizer)
+
     else:
         raise ValueError(f"Processor not available for model {model_name}")
 
@@ -1213,6 +1310,52 @@ def create_multimodal_dataset(model_name: str):
                 return_tensors="pt",
             )
             return {**text_inputs, **image_inputs}
+        elif model_name == "mini_gemma4":
+            # Gemma 4 vision-only: hand-construct per-row batch fields.
+            # `.map(preprocess_function)` is called WITHOUT batched=True, so
+            # `examples` is a single-row dict, not a batch. Each row yields
+            # one synthetic image with a 6x6 patch grid (patch_size=16,
+            # image=96x96) → 36 patches, which pools by pooling_kernel_size=3
+            # down to 4 soft tokens. Per-row tensor shapes carry an image
+            # batch dim of 1 so the DataLoader collate_fn's torch.cat along
+            # dim 0 produces the [B, num_patches, ...] the vision model
+            # expects.
+            gemma4_cfg = MINI_MODEL_SETUPS["mini_gemma4"].mini_model_config
+            vision_cfg = gemma4_cfg.vision_config
+            patch_size = vision_cfg.patch_size  # 16
+            patches_per_side = 6
+            num_patches = patches_per_side * patches_per_side
+            image_token_id = gemma4_cfg.image_token_id
+            pooled_count = (patches_per_side // vision_cfg.pooling_kernel_size) ** 2
+
+            text_inputs = processor.tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=1024,
+                return_tensors="pt",
+            )
+            # Tokenizer already returns [1, 1024] — keep the leading batch
+            # dim so the DataLoader collate_fn's torch.cat along dim 0 gives
+            # [B, 1024] (2D) as the attention-mask kernels expect.
+            input_ids = text_inputs["input_ids"].clone()
+            input_ids[:, :pooled_count] = image_token_id
+            attention_mask = text_inputs["attention_mask"].clone()
+
+            # pixel_values per-row: [1, num_patches, 3 * patch_size**2].
+            pixel_values = torch.zeros(1, num_patches, 3 * patch_size * patch_size, dtype=torch.float32)
+
+            # image_position_ids per-row: [1, num_patches, 2].
+            xs = torch.arange(patches_per_side).repeat(patches_per_side)
+            ys = torch.arange(patches_per_side).repeat_interleave(patches_per_side)
+            image_position_ids = torch.stack([xs, ys], dim=-1).unsqueeze(0).long()
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "pixel_values": pixel_values,
+                "image_position_ids": image_position_ids,
+            }
         else:
             # For other models, use the normal processor
             results = processor(
@@ -1592,6 +1735,27 @@ def run_mini_model_multimodal(
                 pytest.mark.skipif(
                     not GEMMA3_AVAILABLE,
                     reason="Gemma3 not available in this version of transformers",
+                ),
+            ],
+        ),
+        pytest.param(
+            "mini_gemma4",
+            32,
+            1e-5,
+            torch.bfloat16,
+            # Tolerances mirror mini_gemma3. If LUMI runs show drift (as with
+            # the text-only Gemma 4 port), widen loss_atol/logprobs_atol here.
+            5e-2,
+            5e-2,
+            1e-1,
+            1e-1,
+            1e-2,
+            1e-2,
+            marks=[
+                pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+                pytest.mark.skipif(
+                    not GEMMA4_AVAILABLE,
+                    reason="Gemma4 not available in this version of transformers",
                 ),
             ],
         ),
