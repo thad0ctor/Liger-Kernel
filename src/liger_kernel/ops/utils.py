@@ -10,6 +10,7 @@ https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddec
 Modifications made by Yanning Chen, 2024.
 """
 
+import contextlib
 import functools
 import importlib
 import operator
@@ -27,6 +28,24 @@ from liger_kernel.utils import infer_device
 
 def is_hip() -> bool:
     return torch.version.hip is not None
+
+
+def kernel_launch_device_ctx(tensor: torch.Tensor):
+    """Context manager that pins CUDA current-device to the tensor's GPU so
+    Triton kernel launches target the right device.
+
+    Triton launches against torch.cuda.current_device() (default=0). With
+    accelerate device_map sharding, input tensors may live on cuda:N where
+    N != 0 and the kernel fails with
+    "Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)"
+    even though all tensors are on GPU — they're just on a non-default GPU.
+
+    Returns a no-op context for non-CUDA devices so existing XPU/NPU paths
+    are unaffected.
+    """
+    if tensor.device.type == "cuda":
+        return torch.cuda.device(tensor.device)
+    return contextlib.nullcontext()
 
 
 def ensure_contiguous(fn):

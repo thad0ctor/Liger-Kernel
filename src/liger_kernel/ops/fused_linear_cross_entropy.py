@@ -6,6 +6,7 @@ from liger_kernel.ops.utils import amp_custom_bwd
 from liger_kernel.ops.utils import amp_custom_fwd
 from liger_kernel.ops.utils import element_mul_kernel
 from liger_kernel.ops.utils import is_hip
+from liger_kernel.ops.utils import kernel_launch_device_ctx
 from liger_kernel.utils import infer_device
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
@@ -93,6 +94,13 @@ def fused_linear_cross_entropy_forward(
         if ce_weight.stride(-1) != 1:
             ce_weight = ce_weight.contiguous()
 
+    # Triton kernel launches target torch.cuda.current_device() by default. For
+    # models sharded across GPUs via accelerate device_map, the input/weight
+    # tensors may live on a non-default GPU and the kernel cannot access them.
+    # Set the current device to match the input's GPU for the entire chunked
+    # loop so every kernel launch in here lands on the right context.
+    _launch_ctx = kernel_launch_device_ctx(_input)
+    _launch_ctx.__enter__()
     for chunk_id in range(num_chunks):
         start_idx = chunk_id * chunk_size
         end_idx = min((chunk_id + 1) * chunk_size, BT)
@@ -218,6 +226,7 @@ def fused_linear_cross_entropy_forward(
                 out=grad_bias,
                 alpha=1.0,
             )
+    _launch_ctx.__exit__(None, None, None)
 
     # Need extra calculations for backward if reduction=='none'. Not supporting reduction='none' now.
     # if reduction == "none":
@@ -253,41 +262,44 @@ def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, gr
         n_rows = BT
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(H))
 
-        element_mul_kernel[(n_rows,)](
-            grad_input,
-            grad_input.stride(-2),
-            grad_output,
-            H,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
-
-        # handle grad_weight
-        if grad_weight is not None:
-            V, H = grad_weight.shape
-            n_rows = V
-
+        with kernel_launch_device_ctx(grad_input):
             element_mul_kernel[(n_rows,)](
-                grad_weight,
-                grad_weight.stride(-2),
+                grad_input,
+                grad_input.stride(-2),
                 grad_output,
                 H,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=32 if not is_hip() else 16,
             )
 
+        # handle grad_weight
+        if grad_weight is not None:
+            V, H = grad_weight.shape
+            n_rows = V
+
+            with kernel_launch_device_ctx(grad_weight):
+                element_mul_kernel[(n_rows,)](
+                    grad_weight,
+                    grad_weight.stride(-2),
+                    grad_output,
+                    H,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
+
         if grad_bias is not None:
             V = grad_bias.shape[0]
             n_rows = V
 
-            element_mul_kernel[(n_rows,)](
-                grad_bias,
-                grad_bias.stride(-1),
-                grad_output,
-                1,
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=32 if not is_hip() else 16,
-            )
+            with kernel_launch_device_ctx(grad_bias):
+                element_mul_kernel[(n_rows,)](
+                    grad_bias,
+                    grad_bias.stride(-1),
+                    grad_output,
+                    1,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
     return grad_input, grad_weight, grad_bias
 
 
