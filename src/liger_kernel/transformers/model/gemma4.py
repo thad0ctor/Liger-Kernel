@@ -109,6 +109,16 @@ def causal_forward(
 
     if skip_logits:
         # final_logit_softcapping via getattr: some future Gemma 4 variants may omit the attribute entirely.
+        # Align hidden_states (from last decoder layer, possibly on a sharded
+        # GPU) with lm_head.weight (on whatever GPU accelerate placed it) so
+        # the fused-LCE matmul doesn't raise cross-device RuntimeError.
+        lm_head_device = self.lm_head.weight.device
+        if kept_hidden_states.device != lm_head_device:
+            kept_hidden_states = kept_hidden_states.to(lm_head_device)
+            if labels is not None:
+                labels = labels.to(lm_head_device)
+            if shift_labels is not None:
+                shift_labels = shift_labels.to(lm_head_device)
         result = LigerForCausalLMLoss(
             hidden_states=kept_hidden_states,
             lm_head_weight=self.lm_head.weight,
@@ -277,6 +287,14 @@ def multimodal_forward(
         # Flatten hidden state
         shift_hidden_states = shift_hidden_states.view(-1, text_config.hidden_size)
         shift_labels = shift_labels.view(-1).to(hidden_device)
+
+        # Align with lm_head.weight's device. Under accelerate device_map the
+        # last decoder layer and lm_head may land on different GPUs; without
+        # this move the fused-LCE matmul raises a cross-device RuntimeError.
+        lm_head_device = self.lm_head.weight.device
+        if shift_hidden_states.device != lm_head_device:
+            shift_hidden_states = shift_hidden_states.to(lm_head_device)
+            shift_labels = shift_labels.to(lm_head_device)
 
         result = LigerForCausalLMLoss(
             hidden_states=shift_hidden_states,
