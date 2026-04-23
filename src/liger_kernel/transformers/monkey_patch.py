@@ -1252,10 +1252,12 @@ def apply_liger_kernel_to_gemma4_text(
     Apply Liger kernels to replace original implementation in HuggingFace Gemma4
     text models (Gemma4ForCausalLM / Gemma4TextForCausalLM / Gemma4TextModel).
 
-    Primary target: Gemma 4 31B. The 31B config disables PLE
-    (hidden_size_per_layer_input=0), MoE (enable_moe_block=false), KV sharing
-    (num_kv_shared_layers=0), and double-wide MLP (use_double_wide_mlp=false),
-    so every decoder layer is a plain (norm, attn, norm, mlp, norm) stack.
+    Supports both 31B and E2B-it checkpoints. Novel E2B knobs covered here:
+    double-wide MLP on KV-shared layers (sized in ``LigerGEGLUMLPForGemma4``),
+    per-layer-embedding (PLE) RMSNorms patched on every decoder layer plus the
+    model-level ``per_layer_projection_norm``, and KV-shared layer skipping
+    (``k_norm`` / ``v_norm`` are absent on shared layers — ``getattr(..., None)``
+    tolerates both the E2B shared-layer case and the 31B always-present case).
 
     Known limitation: rope kernel swap is a no-op on Gemma 4 — HF's
     apply_rotary_pos_emb takes a single tensor at a time, which is incompatible
@@ -1379,13 +1381,21 @@ def apply_liger_kernel_to_gemma4_text(
                     _maybe_patch_scaled_norm(decoder_layer.post_attention_layernorm)
                     _maybe_patch_scaled_norm(decoder_layer.pre_feedforward_layernorm)
                     _maybe_patch_scaled_norm(decoder_layer.post_feedforward_layernorm)
-                    # q_norm / k_norm exist on every 31B layer (num_kv_shared_layers=0)
-                    # but stay defensive for future variants. v_norm is scale-free
-                    # (with_scale=False) on all Gemma 4 variants so the helper
+                    # k_norm / v_norm are missing on E2B KV-shared layers;
+                    # getattr(..., None) handles both cases (present on 31B and
+                    # on E2B non-shared layers, absent on E2B shared layers).
+                    # v_norm is with_scale=False on all variants so the helper
                     # intentionally leaves it untouched.
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "q_norm", None))
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "k_norm", None))
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "v_norm", None))
+                    # PLE injection RMSNorm — present on every decoder layer
+                    # when hidden_size_per_layer_input > 0 (E2B), absent on 31B.
+                    _maybe_patch_scaled_norm(getattr(decoder_layer, "post_per_layer_input_norm", None))
+
+            if rms_norm:
+                # Model-level PLE projection norm (E2B only); absent on 31B.
+                _maybe_patch_scaled_norm(getattr(base_model, "per_layer_projection_norm", None))
         else:
             raise TypeError("The model must be Gemma4ForCausalLM, Gemma4TextForCausalLM, or Gemma4TextModel.")
 
@@ -1408,6 +1418,12 @@ def apply_liger_kernel_to_gemma4(
     swapped. Calling this on a model with an active audio tower will leave the
     audio half untouched (no warnings are emitted; the vision + text halves
     still benefit from Liger).
+
+    E2B checkpoints may carry an ``audio_config``; Phase A does not touch the
+    audio tower, and this function explicitly leaves ``audio_model`` untouched.
+    The vision half and the E2B text-side knobs (double-wide MLP on KV-shared
+    layers, PLE RMSNorms) are covered via the delegation to
+    ``apply_liger_kernel_to_gemma4_text``.
 
     Patching delegates the language-model half to
     ``apply_liger_kernel_to_gemma4_text`` and additionally swaps vision-side
