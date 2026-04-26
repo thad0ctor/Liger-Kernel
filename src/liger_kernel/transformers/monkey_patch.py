@@ -1241,7 +1241,7 @@ def apply_liger_kernel_to_gemma3(
 
 
 def apply_liger_kernel_to_gemma4_text(
-    rope: bool = True,
+    rope: bool = False,
     cross_entropy: bool = False,
     fused_linear_cross_entropy: bool = True,
     rms_norm: bool = True,
@@ -1266,8 +1266,8 @@ def apply_liger_kernel_to_gemma4_text(
     logits tensor eliminated at seq 8192 / vocab 262144) is unaffected.
 
     Args:
-        rope (bool): Reserved for API consistency with other apply_liger_kernel_to_*
-            functions. Currently a no-op for Gemma 4 (emits a warning). Default True.
+        rope (bool): Currently a no-op for Gemma 4 (HF uses single-tensor
+            apply_rotary_pos_emb incompatible with Liger). Default False.
         cross_entropy (bool): Whether to apply Liger's cross entropy loss. Default False.
         fused_linear_cross_entropy (bool): Fused linear CE for memory efficiency. Default True.
             Mutually exclusive with `cross_entropy`.
@@ -1401,7 +1401,7 @@ def apply_liger_kernel_to_gemma4_text(
 
 
 def apply_liger_kernel_to_gemma4(
-    rope: bool = True,
+    rope: bool = False,
     cross_entropy: bool = False,
     fused_linear_cross_entropy: bool = True,
     layer_norm: bool = True,  # no-op, kept for API parity with gemma3
@@ -1430,11 +1430,11 @@ def apply_liger_kernel_to_gemma4(
     RMSNorms and GEGLU MLPs.
 
     Args:
-        rope (bool): Reserved for API parity. Currently a no-op on both text and
-            vision halves of Gemma 4 — HF's ``apply_rotary_pos_emb`` uses a
-            single-tensor signature that is incompatible with Liger's
-            ``liger_rotary_pos_emb``. The text-path warning is emitted once.
-            Default True.
+        rope (bool): Currently a no-op on both text and vision halves of
+            Gemma 4 — HF's ``apply_rotary_pos_emb`` uses a single-tensor
+            signature incompatible with Liger's ``liger_rotary_pos_emb``.
+            The text-path warning is emitted once when set True.
+            Default False.
         cross_entropy (bool): Whether to apply Liger's cross entropy loss.
             Gemma4 routes loss through ``self.loss_function``; this flag is
             kept for API parity with other patches. Default False.
