@@ -2349,7 +2349,7 @@ def run_mini_model(
             torch.bfloat16,
             5e-2,  # loss_atol — 6-layer mini in bf16 drifts ~0.05 on a few steps (vs 4-layer gemma3 which fits 1e-2)
             1e-2,
-            7e-1,  # logprobs_atol — top-k near-tie slot flips; ~0.5 on Ampere/Ada, ~0.6 on Blackwell (bf16 tensor-core precision differs)
+            5e-1,  # logprobs_atol — 3 of ~20k top-k logprob slots flip by ~0.5 due to bf16 near-ties
             1e-2,
             1e-2,
             1e-2,

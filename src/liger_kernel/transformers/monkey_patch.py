@@ -1252,12 +1252,19 @@ def apply_liger_kernel_to_gemma4_text(
     Apply Liger kernels to replace original implementation in HuggingFace Gemma4
     text models (Gemma4ForCausalLM / Gemma4TextForCausalLM / Gemma4TextModel).
 
-    Supports both 31B and E2B-it checkpoints. Novel E2B knobs covered here:
-    double-wide MLP on KV-shared layers (sized in ``LigerGEGLUMLPForGemma4``),
-    per-layer-embedding (PLE) RMSNorms patched on every decoder layer plus the
-    model-level ``per_layer_projection_norm``, and KV-shared layer skipping
-    (``k_norm`` / ``v_norm`` are absent on shared layers — ``getattr(..., None)``
-    tolerates both the E2B shared-layer case and the 31B always-present case).
+    Primary target: Gemma 4 31B. The 31B config disables PLE
+    (hidden_size_per_layer_input=0), MoE (enable_moe_block=false), KV sharing
+    (num_kv_shared_layers=0), and double-wide MLP (use_double_wide_mlp=false),
+    so every decoder layer is a plain (norm, attn, norm, mlp, norm) stack.
+
+    Also covers Gemma 4 E2B-it: when ``hidden_size_per_layer_input>0`` the
+    PLE injection RMSNorms (``post_per_layer_input_norm`` per decoder layer
+    and the model-level ``per_layer_projection_norm``) are patched in
+    addition to the standard layernorms; when ``num_kv_shared_layers>0``
+    the shared layers omit ``k_norm`` / ``v_norm`` and the
+    ``getattr(..., None)`` calls below tolerate either case; when
+    ``use_double_wide_mlp=True`` the per-layer MLP sizing is handled by
+    ``LigerGEGLUMLPForGemma4``.
 
     Known limitation: rope kernel swap is a no-op on Gemma 4 — HF's
     apply_rotary_pos_emb takes a single tensor at a time, which is incompatible
@@ -1376,11 +1383,13 @@ def apply_liger_kernel_to_gemma4_text(
                     _maybe_patch_scaled_norm(decoder_layer.post_attention_layernorm)
                     _maybe_patch_scaled_norm(decoder_layer.pre_feedforward_layernorm)
                     _maybe_patch_scaled_norm(decoder_layer.post_feedforward_layernorm)
-                    # k_norm / v_norm are missing on E2B KV-shared layers;
-                    # getattr(..., None) handles both cases (present on 31B and
-                    # on E2B non-shared layers, absent on E2B shared layers).
-                    # v_norm is with_scale=False on all variants so the helper
+                    # q_norm / k_norm exist on every 31B layer (num_kv_shared_layers=0)
+                    # but stay defensive for future variants. v_norm is scale-free
+                    # (with_scale=False) on all Gemma 4 variants so the helper
                     # intentionally leaves it untouched.
+                    # On Gemma 4 E2B-it the KV-shared decoder layers (layer_idx >=
+                    # num_hidden_layers - num_kv_shared_layers) omit k_norm / v_norm
+                    # entirely; the same getattr(..., None) calls cover that case.
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "q_norm", None))
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "k_norm", None))
                     _maybe_patch_scaled_norm(getattr(decoder_layer.self_attn, "v_norm", None))
