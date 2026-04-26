@@ -28,35 +28,28 @@ class LigerGEGLUMLP(nn.Module):
 
 
 class LigerGEGLUMLPForGemma4(LigerGEGLUMLP):
-    """GEGLU MLP drop-in for HF's ``Gemma4TextMLP``.
+    """GEGLU MLP wrapper matching Gemma4TextMLP's (config, layer_idx) constructor.
 
-    HF's ``Gemma4TextMLP`` is instantiated as ``Gemma4TextMLP(config, layer_idx)``
-    and sizes ``intermediate_size`` per-layer: KV-shared layers (layers at
-    ``i >= num_hidden_layers - num_kv_shared_layers``) use ``2*intermediate_size``
-    when ``use_double_wide_mlp=True`` (E2B-it); all other layers and all 31B
-    layers use ``intermediate_size`` unchanged. Forward is inherited from
-    ``LigerGEGLUMLP``.
+    HF's Gemma4TextMLP conditionally doubles intermediate_size for KV-shared layers
+    when ``config.use_double_wide_mlp=True``. This subclass replicates that logic
+    so the class-level swap works for all Gemma 4 variants (31B text, future MoE).
 
-    Internal monkey-patch helper only — not part of the public API surface.
+    See: https://github.com/huggingface/transformers/blob/74a2a4d0c/src/transformers/models/gemma4/modeling_gemma4.py#L1030-L1035
     """
 
     def __init__(self, config, layer_idx=None):
-        # Do not chain through LigerGEGLUMLP.__init__: it would create linears
-        # at the base intermediate_size, missing the double-wide KV-shared path.
-        nn.Module.__init__(self)
-
-        # Mirrors transformers.models.gemma4.modular_gemma4.Gemma4TextMLP sizing.
-        num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
-        first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
-        is_kv_shared_layer = layer_idx is not None and layer_idx >= first_kv_shared_layer_idx > 0
-        use_double_wide_mlp = getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
-
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size * (2 if use_double_wide_mlp else 1)
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        super().__init__(config)
+        # Match HF's conditional doubling for KV-shared layers
+        if layer_idx is not None and getattr(config, "use_double_wide_mlp", False):
+            num_hidden = getattr(config, "num_hidden_layers", 0)
+            num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+            first_kv_shared = num_hidden - num_kv_shared
+            if num_kv_shared > 0 and layer_idx >= first_kv_shared:
+                doubled = config.intermediate_size * 2
+                self.intermediate_size = doubled
+                self.gate_proj = nn.Linear(self.hidden_size, doubled, bias=False)
+                self.up_proj = nn.Linear(self.hidden_size, doubled, bias=False)
+                self.down_proj = nn.Linear(doubled, self.hidden_size, bias=False)
 
 
 class LigerGEGLUMLPForGemma4Vision(nn.Module):

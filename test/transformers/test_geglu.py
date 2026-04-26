@@ -368,3 +368,103 @@ def test_gemma4_mlp_no_doubling_when_zero_kv_shared():
     for layer_idx in [0, 15, 31]:
         mlp = LigerGEGLUMLPForGemma4(cfg, layer_idx=layer_idx)
         assert mlp.intermediate_size == cfg.intermediate_size
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 vision MLP — both use_clipped_linears branches
+# ---------------------------------------------------------------------------
+
+
+def _copy_vision_mlp_weights(src, dst):
+    """Copy gate/up/down projection weights from src Gemma4VisionMLP to dst.
+
+    Both ``Gemma4VisionMLP`` and ``LigerGEGLUMLPForGemma4Vision`` wrap each
+    projection in a ``Gemma4ClippableLinear`` whose ``nn.Linear`` lives at
+    ``.linear``. Copy the weights through that nested attribute so the two
+    forwards see identical parameters.
+    """
+    dst.gate_proj.linear.weight.data.copy_(src.gate_proj.linear.weight.data)
+    dst.up_proj.linear.weight.data.copy_(src.up_proj.linear.weight.data)
+    dst.down_proj.linear.weight.data.copy_(src.down_proj.linear.weight.data)
+
+
+def test_gemma4_vision_mlp_fast_path_matches_hf():
+    """use_clipped_linears=False: Liger fast path matches HF reference forward."""
+    pytest.importorskip("transformers.models.gemma4")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionMLP
+
+    from liger_kernel.transformers.geglu import LigerGEGLUMLPForGemma4Vision
+
+    torch.manual_seed(0)
+    cfg = Gemma4VisionConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        use_clipped_linears=False,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+
+    hf_mlp = Gemma4VisionMLP(cfg).to(device)
+    liger_mlp = LigerGEGLUMLPForGemma4Vision(cfg).to(device)
+    _copy_vision_mlp_weights(hf_mlp, liger_mlp)
+
+    x = torch.randn(2, 8, cfg.hidden_size, device=device, dtype=torch.float32)
+
+    y_hf = hf_mlp(x)
+    y_liger = liger_mlp(x)
+
+    assert y_hf.shape == y_liger.shape
+    assert torch.allclose(y_hf, y_liger, atol=1e-5, rtol=1e-5)
+
+
+def test_gemma4_vision_mlp_clipped_path_matches_hf():
+    """use_clipped_linears=True: Liger clipped fallback matches HF reference forward.
+
+    The clipped path bypasses the Liger GEGLU kernel and goes through HF's
+    ``Gemma4ClippableLinear.forward`` (which applies input/output clamps) plus
+    HF's reference GELU formula. Set finite clamp buffers to actually exercise
+    the clamping logic instead of leaving them at ±inf no-ops.
+    """
+    pytest.importorskip("transformers.models.gemma4")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionMLP
+
+    from liger_kernel.transformers.geglu import LigerGEGLUMLPForGemma4Vision
+
+    torch.manual_seed(0)
+    cfg = Gemma4VisionConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        use_clipped_linears=True,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+
+    hf_mlp = Gemma4VisionMLP(cfg).to(device)
+    liger_mlp = LigerGEGLUMLPForGemma4Vision(cfg).to(device)
+    _copy_vision_mlp_weights(hf_mlp, liger_mlp)
+
+    # Set finite clamps on every Gemma4ClippableLinear so the clamp branch
+    # actually fires. Mirror across HF and Liger so both clamp identically.
+    for hf_proj, liger_proj in [
+        (hf_mlp.gate_proj, liger_mlp.gate_proj),
+        (hf_mlp.up_proj, liger_mlp.up_proj),
+        (hf_mlp.down_proj, liger_mlp.down_proj),
+    ]:
+        for name, value in [
+            ("input_min", -2.0),
+            ("input_max", 2.0),
+            ("output_min", -5.0),
+            ("output_max", 5.0),
+        ]:
+            t = torch.tensor(value, device=device)
+            hf_proj.get_buffer(name).copy_(t)
+            liger_proj.get_buffer(name).copy_(t)
+
+    # Use a wide-amplitude input so values cross the ±2.0 input clamp.
+    x = torch.randn(2, 8, cfg.hidden_size, device=device, dtype=torch.float32) * 3.0
+
+    y_hf = hf_mlp(x)
+    y_liger = liger_mlp(x)
+
+    assert y_hf.shape == y_liger.shape
+    assert torch.allclose(y_hf, y_liger, atol=1e-5, rtol=1e-5)
